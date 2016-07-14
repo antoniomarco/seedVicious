@@ -1,0 +1,541 @@
+#!/usr/bin/perl -w
+use strict;
+
+use Getopt::Long qw(:config no_ignore_case bundling);
+use PerlIO::gzip;
+
+
+use lib::Mitargets; # Mitargets requires Vienna package installed, or local folder
+use lib::Micompare; # subroutines for comparative analysis of Mitargets objects (including evolutionary models)
+
+# ADD alignemnts ; first option, then sanity check of format
+
+
+#=begin Program Description
+#
+#	seedVicious version 1.0
+#	Antonio Marco, 2016
+#	http://amarco.net/
+#	University of Essex
+#
+#	This script predicts microRNA target sites based on the definition of canonical seeds by Bartel 2009
+#	It also allows the evolutionary analysis of microRNA target sites in sequence alignments
+#
+#	Basic usage:
+#	./seedVicious -i INPUT_TRANSCRIPTS_FASTA -m MICRORNAS_FASTA -o OUTPUT_FILE
+#	./seedVicious -h   # prints help screen
+#
+#	Citation:
+#	Marco A (2016) XXXXXXXXX. bioRkiv XXXX
+#
+#=cut
+
+# Quick help if no parameters are provided
+unless(@ARGV){
+	print STDERR "\nNo arguments specified\nType \"seedVicious -h\" for help\n\n";
+	exit;
+}
+
+# Start time
+my $start_time = time();
+my $arguments = join(" ",@ARGV);
+
+# OPTIONS
+my %options = ( );
+
+# INPUT/OUTPUT (declaration and default values)
+$options{"infile_tr"}       =   "infile_tr";
+$options{"infile_mir"}      =   "infile_mir";
+$options{"infile_nwk"}      =   "infile_nwk"; # input tree for parsimony analysis
+$options{"outfile"}         =   "STDOUT";
+$options{"help"}            =   0;      # print help
+$options{"verbose"}         =   0;      # 0: table; 1: detailed output
+$options{"noheader"}        =   0;      # 0: no header; 1: header
+$options{"alignment"}       =   0;      # 0: no; 1: yes
+
+# Extra options, defined in Micompare.pm
+$options{"extra"}           =   0;      # 0: no; 1: compare targets; 2: compare target sites (allignment); 3: Parsimony-based reconstruction of ancestral states (alignment), required input NEWICK tree; 4: reports pairs of targets and distances (minimum); 44: reports ONLY pairs of targets and distances (minimum)
+
+# TARGET PREDICTION, defined in Mitargets.pm
+$options{"reverse"}         =   0;      # 0: no, 1: only; 2: both
+$options{"energy"}          =   0;      # Calculates the pairing energy
+$options{"seedfam"}         =   0;      # 0: all individual miRNAs, 1: merge seedfamilies (as in Targetscan)
+$options{"longtr"}          =   0;      # 0: all individual transcripts, 1: report only longest transcript for the same gene
+$options{"sixmers"}         =   0;      # Reports sixmers as target sites
+$options{"offsets"}         =   0;      # Reports offsets-sixmers as target sites
+$options{"near"}            =   0;      # 0: only canonical seeds; 1: one-mutant neighbours at the sixmer reported (SLOW)
+
+# Modify parameters according to the ARGUMENT line (user defined)
+GetOptions(
+	"infile_tr=s"=>\$options{"infile_tr"}, "i=s"=>\$options{"infile_tr"},
+	"infile_mir=s"=>\$options{"infile_mir"}, "m=s"=>\$options{"infile_mir"},
+	"infile_nwk=s"=>\$options{"infile_nwk"}, "t=s"=>\$options{"infile_nwk"},
+	"outfile=s"=>\$options{"outfile"}, "o=s"=>\$options{"outfile"},
+	"reverse=i"=>\$options{"reverse"}, "r=i"=>\$options{"reverse"},
+	"energy"=>\$options{"energy"}, "e"=>\$options{"energy"},
+	"seedfam"=>\$options{"seedfam"}, "f"=>\$options{"seedfam"},
+	"verbose"=>\$options{"verbose"}, "v"=>\$options{"verbose"},
+	"noheader"=>\$options{"noheader"}, "c"=>\$options{"noheader"}, # 'c' as in 'chop'
+	"alignment"=>\$options{"alignment"}, "a"=>\$options{"alignment"},
+	"extra"=>\$options{"extra"}, "x=i"=>\$options{"extra"},
+	"longtr"=>\$options{"longtr"}, "l"=>\$options{"longtr"},
+	"sixmers"=>\$options{"sixmers"}, "6"=>\$options{"sixmers"},
+	"offsets"=>\$options{"offsets"}, "9"=>\$options{"offsets"},
+	"near"=>\$options{"near"}, "n"=>\$options{"near"},
+	"help"=> \$options{"help"}, "h"=> \$options{"help"}
+);
+
+
+# Print HELP screen
+if($options{"help"}){
+	print helpScreen();
+	exit;
+}
+
+# FOR EXTRA OPTIONS
+my $main_output = 1; # if a double number is selected in the 'extra' option, only the extra output is provided as this is set to zero
+if((length $options{"extra"})>1){
+    $main_output = 0;
+}
+
+
+# PRINT RUNNIG HEADER
+system("clear");
+print STDERR runningHeader();
+
+print STDERR "Reading and indexing input files...\r";
+
+# Open and index microRNA file
+if(! -e $options{"infile_mir"}){die "ERROR: MicroRNA input file (".$options{"infile_mir"}." does not exist.\n"};
+if($options{"infile_mir"} =~ /.gz$/){ # READ GZIP COMPRESSED FILES
+    open(MATURE,"<:gzip", $options{"infile_mir"}) or die "Error: Unable to uncompress ".$options{"infile_mir"}." file";
+}else{
+    open(MATURE,$options{"infile_mir"});
+}
+my %mirna = hashFromFastaRNA(join("",<MATURE>));
+close MATURE;
+
+# Open and index transcript file
+if(! -e $options{"infile_tr"}){die "ERROR: Transcript input file (".$options{"infile_tr"}." does not exist.\n"};
+if($options{"infile_tr"} =~ /.gz$/){ # READ GZIP COMPRESSED FILES
+    open(TRANSCRIPT,"<:gzip", $options{"infile_tr"}) or die "Error: Unable to uncompress ".$options{"infile_tr"}." file";
+}else{
+    open(TRANSCRIPT,$options{"infile_tr"});
+}
+my %transcript = hashFromFastaRNA(join("",<TRANSCRIPT>));
+close TRANSCRIPT;
+
+
+
+# RESET TO VALID OPTIONS FOR COMPARATIVE ANALYSIS
+if($options{"extra"} != 0){
+    $options{"reverse"} = 0;
+    $options{"energy"} = 0;
+    $options{"near"} = 0; # No near targets
+    $options{"seedfam"} = 1;
+    if(($options{"extra"} == 2)||($options{"extra"} == 3)){
+        $options{"longtr"} = 0;  
+	$options{"alignment"} = 1;  
+    }  
+}    
+
+# ACCEPT OTHER FORMATS IN THE FUTURE?
+if($options{"alignment"}){
+# CHECK THAT THE FILE IS A VALID FASTA ALIGNMENT
+    my $first_transcript_length = "empty";
+    for(keys %transcript){
+	if($first_transcript_length eq "empty"){
+	    $first_transcript_length = length($transcript{$_});
+	}else{
+	    unless($first_transcript_length == length($transcript{$_})){die "Error: Invalid alignment input file. Different lengths."};
+	    
+	}
+    }
+# FORCE OPTIONS FOR ALIGNMENT
+    $options{"energy"}=0; # No energy display for alignments
+    $options{"verbose"}=0; # Only reports in table format
+    $options{"near"}=0; # No near targets for alignments
+    $options{"reverse"}=0; # No reverse scan for alignments
+    $options{"longtr"}=0; # Do not remove any transcript / NA
+}
+
+
+if($options{"longtr"}==1){
+    %transcript = get_longest_transcript(\%transcript);
+}
+
+
+# Merge seed families into single sequences
+if($options{"seedfam"}==1){
+    $options{"energy"}=0; # No energy display for families
+    %mirna = merge_seed_families(\%mirna);
+}
+
+# Index near microRNA seeds
+my %near_mirna = ( );
+if($options{"near"}==1){
+    %near_mirna = index_near_mirnas(\%mirna);
+    $options{"energy"}=0; # No energy display for near targets
+}
+
+
+my $newicktree = "none";
+# Read NEWICK tree file
+if($options{"extra"}==3){ # Extra options requiring a tree
+    if(! -e $options{"infile_nwk"}){die "ERROR: NEWICK input tree file (".$options{"infile_nwk"}." does not exist.\n"};
+    open(TREE,$options{"infile_nwk"});
+    $newicktree = (join("",<TREE>));
+    close TREE;
+}
+
+
+# TARGET PREDICTION
+
+# PREDICT microRNA TARGETS using 'Mitargets'
+
+# FORWARD orientation microRNA targets
+my %Targets = ( );
+unless($options{"reverse"}==1){ # Option to not to report forward targets
+    my $mir_count = 0;
+    foreach my $mir (keys %mirna){
+	$mir_count++;
+	print STDERR "Predicting microRNA targets...        ".$mir_count." out of ". (scalar keys %mirna) ." microRNAs\r";
+	# For each microRNA in input file
+	foreach my $utr (keys %transcript){
+	# For each transcript in input file
+	    my $tar = new Mitargets($mir,$mirna{$mir},$utr,$transcript{$utr},\%options);
+	    $Targets{$tar->getID} = $tar;
+	}
+    }
+    if($options{"near"}==1){ # NEAR MICRORNAS
+	print STDERR "Predicting near-targets. This may take a long while...                                 \r";
+	foreach my $mir (keys %near_mirna){
+	    foreach my $near (@{$near_mirna{$mir}}){
+	    # For each microRNA in input file
+		foreach my $utr (keys %transcript){
+		    # For each transcript in input file
+		    my $tar = new Mitargets($mir,$near,$utr,$transcript{$utr},\%options);
+		    $tar->setID($tar->getID."=>near[".$near."]");
+		    $Targets{$tar->getID} = $tar;
+		}
+	    }
+	}
+    }
+}
+
+# REVERSE orientation microRNA targets
+my %Targets_reverse = ( );
+unless($options{"reverse"}==0){
+    my $mir_count = 0;
+    foreach my $mir (keys %mirna){
+	# For each microRNA in input file
+	print STDERR "Predicting microRNA targets...        ".$mir_count." out of ". (scalar keys %mirna) ."microRNAs (reverse)\r";
+	foreach my $utr (keys %transcript){
+	    my $reverse_tr = reverseComp($transcript{$utr});
+	    # For each transcript in input file
+	    my $tar = new Mitargets($mir,$mirna{$mir},$utr."(R)",$reverse_tr,\%options);
+	    $Targets_reverse{$tar->getID} = $tar;
+	}
+    }
+    if($options{"near"}==1){ # NEAR MICRORNAS
+	print STDERR "\tPredicting near-targets for reverse strand. This may take a long while...                        \r";
+	foreach my $mir (keys %near_mirna){
+		foreach my $near (@{$near_mirna{$mir}}){
+		# For each microRNA in input file
+		    foreach my $utr (keys %transcript){
+		    my $reverse_tr = reverseComp($transcript{$utr});
+		    # For each transcript in input file
+			my $tar = new Mitargets($mir,$near,$utr."(R)",$reverse_tr,\%options);
+			$tar->setID($tar->getID."=>".$near);
+			$Targets_reverse{$tar->getID} = $tar;
+		    }
+		}
+	    }
+    }
+}
+
+
+
+# OUTPUT
+# (to do - sort output by transcript and miRNA, according to input order)
+unless($options{'outfile'} eq "STDOUT"){
+    open(OUTPUT,">$options{'outfile'}");
+}
+print STDERR "Writing output file...                                                          \r";
+
+unless($main_output==0){ #### DO NOT PRINT MAIN OUTPUT, ONLY EXTRA ANALYSIS
+
+    # Print header
+    if(($options{"energy"}==1)&&($options{"verbose"}==0)){
+	unless($options{"noheader"}==1){
+	    if($options{'outfile'} eq "STDOUT"){
+		print "miR\ttr\tpos\ttype\ten\n";
+	    }else{
+		print OUTPUT "miR\ttr\tpos\ttype\ten\n";
+	    }
+	} # Header
+    }elsif(($options{"energy"}==0)&&($options{"verbose"}==0)){
+	unless($options{"noheader"}==1){
+	    if($options{'outfile'} eq "STDOUT"){
+		print "miR\ttr\tpos\ttype\n";
+	    }else{
+		print OUTPUT "miR\ttr\tpos\ttype\n";
+	    }
+	} # Header
+    }else{
+	if($options{'outfile'} eq "STDOUT"){
+	    print runningHeader();
+	    print "Script options (Local Time: ".localtime()."):\n./seedVicious ".$arguments."\n\n";
+	}else{
+	    print OUTPUT runningHeader();
+	    print OUTPUT "Script options (Local Time: ".localtime()."):\n./seedVicious ".$arguments."\n\n";
+	}
+    }
+
+    # OUTPUT forward targets
+    if($options{"reverse"}!=1){ # If forward strand options (0 or 2) selected
+	for(keys %Targets){
+	    if($Targets{$_}->printTargetsOutput($options{"verbose"},$options{"alignment"})){
+		if($options{'outfile'} eq "STDOUT"){
+		    print $Targets{$_}->printTargetsOutput($options{"verbose"},$options{"alignment"});
+		}else{
+		    print OUTPUT $Targets{$_}->printTargetsOutput($options{"verbose"},$options{"alignment"});
+		}
+	    }else{
+	#        print OUTPUT "notarget_ to be defined as an option?\n";
+	    }
+	}
+    }
+
+    if($options{"reverse"}!=0){ # If reverse strand options (1 or 2) selected
+	#OUTPUT reverse targets
+	for(keys %Targets_reverse){
+	    if($Targets_reverse{$_}->printTargetsOutput($options{"verbose"},$options{"alignment"})){
+		if($options{'outfile'} eq "STDOUT"){
+		    print $Targets_reverse{$_}->printTargetsOutput($options{"verbose"},$options{"alignment"});
+		}else{
+		    print OUTPUT $Targets_reverse{$_}->printTargetsOutput($options{"verbose"},$options{"alignment"});
+		}
+	    }else{
+	#        print OUTPUT "notarget_ to be defined as an option?\n";
+	    }
+	}
+    }
+
+}# END OF NO PRINTING MAIN OUTPUT
+
+# Extra output / Comparative analysis
+# only forward targets, no near targets considered
+# TO DO, allow multiple comparative analyses at the same time
+if($options{"extra"}==0){ # no extra comparative analysis
+}elsif(($options{"extra"}==1)||($options{"extra"}==11)){
+      if($options{'outfile'} eq "STDOUT"){
+	    print micompareTargets(\%Targets);
+      }else{
+	    print OUTPUT micompareTargets(\%Targets);
+      }
+}elsif(($options{"extra"}==2)||($options{"extra"}==22)){
+      if($options{'outfile'} eq "STDOUT"){
+	    print micompareTargetSites(\%Targets);
+      }else{
+	    print OUTPUT micompareTargetSites(\%Targets);
+      }
+}elsif(($options{"extra"}==3)||($options{"extra"}==33)){
+      if($options{'outfile'} eq "STDOUT"){
+	    print gainsLossesParsimony(\%Targets,$newicktree);
+      }else{
+	    print OUTPUT gainsLossesParsimony(\%Targets,$newicktree);
+      }
+}elsif(($options{"extra"}==4)||($options{"extra"}==44)){
+      if($options{'outfile'} eq "STDOUT"){
+	    print seedPairs(\%Targets);
+      }else{
+	    print OUTPUT seedPairs(\%Targets);
+      }
+}else{
+	if($options{'outfile'} eq "STDOUT"){
+	    print "Warning: Undefined extra analysis\n"
+	}else{
+	    print OUTPUT "Warning: Undefined extra analysis\n"
+	}
+}
+
+
+
+unless($options{'outfile'} eq "STDOUT"){
+    close OUTPUT;
+}
+
+
+# END OF PROGRAM #
+print STDERR "Done!                                                          \n";
+print STDERR "--------------------------------------\nOptions: ".$arguments."\n\n";
+my $end_time = time();
+print STDERR "Job took ". ( $end_time - $start_time ) . " seconds\n";
+exit 0;
+
+
+
+###############
+# SUBROUTINES #
+###############
+
+sub hashFromFastaRNA{
+# From a scalar in FASTA format, it returns a hash, each sequence name is a key and the value is the sequence.
+# Sequences are assumed to be RNA. All 'T' translated to 'U'
+# Non-nucleotide characters are masked with 'X's
+    my %OUT = ( );
+    my @ELEMENTS = split(">",$_[0]);
+    shift(@ELEMENTS);
+
+    for (@ELEMENTS){
+        my @LINES = split("\n",$_);
+        for(@LINES){$_ =~ s/\v+$//;}; # Remove end-of-line for multiple platforms
+        my $name = $LINES[0];
+        shift(@LINES);
+        my $outseq = join("",@LINES);#
+        $outseq =~ tr/[a-z]/[A-Z]/;#
+        $outseq =~ tr/T/U/;#
+#         $outseq =~ s/[^ACGU]/X/;#  #  This masking is done at a later stage by Mitargets.pm. Comment out to avoid errors when parsing MS/OSX formatted files.
+        if(exists $OUT{$name}){print STDERR "WARNING: Sequences with the same name will be overwritten\n"};
+        $OUT{$name} = $outseq;
+    }
+    return %OUT;
+}
+
+sub reverseComp{
+# Reverse complement of an RNA
+    my $dna = $_[0];
+    my $revcomp = reverse($dna);
+    $revcomp =~ tr/ACGUacgu/UGCAugca/;
+    return $revcomp;
+}
+
+sub index_near_mirnas{
+# Indexes (generates) microRNAs (seed sequences) with one nucleotide difference with respect to input microRNA
+    my %input_miRNAs = %{$_[0]};
+    my %output_hash = ( );
+    for(keys %input_miRNAs){
+        my @output_miRNAs = ( );
+        my $mat = $input_miRNAs{$_};
+        for(my $i=1; $i<7; $i++){
+            for(not_this_nucleotide_rna(substr($mat,$i,1))){
+                push(@output_miRNAs,substr($mat,0,$i) . $_ . substr($mat,$i+1,length($mat)-($i+1)));
+            }
+        }
+        $output_hash{$_} = \@output_miRNAs;
+    }
+    return %output_hash;
+}
+
+sub not_this_nucleotide_rna{
+# Check if a nucleotive is valid for an RNA sequence (A,G,C,U)
+    if($_[0] eq "A"){
+        return ("C","U","G");
+    }elsif($_[0] eq "C"){
+        return ("A","U","G");
+    }elsif($_[0] eq "G"){
+        return ("C","U","A");
+    }elsif($_[0] eq "U"){
+        return ("C","A","G");
+    }else{
+#         die "Error: not valid nucleoticde in RNA sequence\n";
+    }
+}
+
+sub merge_seed_families{
+# Merge microRNAs with the same canonical targets (seed families)
+    my %input_mirna = %{$_[0]};
+    my %output_mirna = ( );
+    my %families = ( );
+    foreach my $miR (sort keys %input_mirna){
+        my $family_seed = "X" . substr($input_mirna{$miR},1,7);
+        if(exists $families{$family_seed}){
+            $families{$family_seed} .= ";".$miR;
+        }else{
+            $families{$family_seed}=$miR;
+        }
+    }
+    foreach my $name (keys %families){
+        $output_mirna{$families{$name}} = $name;
+    }
+    return %output_mirna;
+}
+
+sub get_longest_transcript{
+# Selects the longest transcript for each gene from a FASTA indexed array, in which the name of the sequence is of the form GENENAME|TRANSCRIPTNAME (as it is in the output from MARTVIEW)
+    my %current_tr = ( );
+    my %current_seq = ( );
+    my %input_hash = %{$_[0]};
+    foreach my $name (keys %input_hash){
+        if($name =~ /(.+)\|(.+)/){
+            if(exists $current_seq{$1}){
+                if(length($input_hash{$name})>length($current_seq{$1})){
+                    $current_seq{$1}= $input_hash{$name};
+                    $current_tr{$1} = $2;
+                }
+            }else{
+                $current_seq{$1}= $input_hash{$name};
+                $current_tr{$1} = $2;
+            }
+        }else{
+            print STDERR "WARNING: ";
+            print STDERR "Longest transcript option requires that each transcript name is of the form:\n";
+            print STDERR "\>GENE_NAME\|TRANSCRIPT_NAME\n";
+            print STDERR "Disabling option\n";
+            return %input_hash;
+        }
+    }
+    my %out_hash = ( );
+    for(keys %current_seq){
+        $out_hash{$_."|".$current_tr{$_}}=$current_seq{$_};
+    }
+    return %out_hash;
+}
+
+sub helpScreen{
+# Help screen
+	my $output = runningHeader()."\n";
+
+	$output .= "Usage:\n   ./seedVicious -i <INPUT_TRANSCRIPTS_FASTA> -m <MICRORNAS_FASTA> -o <OUTPUT_FILE> [-ARGUMENT <VALUE>]\n";
+	$output .= "\nProgram Options (arguments). Default values in box brackets:\n";
+	$output .= "\t-h / --help\t\tPrint this screen\n";
+	$output .= "\t-i / --infile_tr\tInput file of transcript sequences in FASTA ('gz' compressed files allowed) [infile_tr]\n";
+	$output .= "\t-m / --infile_mir\tInput file of mature microRNA sequences in FASTA ('gz' compressed files allowed) [infile_mir]\n";
+	$output .= "\t-t / --infile_nwk\tInput tree file in NEWICK format [infile_nwk]\n";
+	$output .= "\t-o / --outfile\t\tOutput file [STDOUT]\n";
+	$output .= "\t-v / --verbose\t\tDetailed output file [DISABLED, table]\n";
+	$output .= "\t-c / --noheader\t\tDo not print header in output file [print header]\n";
+	$output .= "\t-a / --alignment\tInput transcript file is an alignment [DISABLED]\n";
+	$output .= "\t-x / --extra\t\tExtra comparative analyses of results. 1: targets, 2: target sites, 3: ancestral states, 4: seed-pairs (see Manual) [DISABLED]\n";
+	$output .= "\t-f / --seedfam\t\tMerge microRNAs with the same seed into unique sequences [DISABLED]\n";
+	$output .= "\t-l / --longtr\t\tScan only the longest transcript isoform for each gene [DISABLED]\n";
+	$output .= "\t-6 / --sixmer\t\tConsider 'sixmer' targets [DISABLED]\n";
+	$output .= "\t-9 / --offsets\t\tConsider 'offset-sixmer' targets [DISABLED]\n";
+	$output .= "\t-n / --near\t\tEvaluate near-targets (slow) [DISABLED]\n";	
+	$output .= "\t-r / --reverse\t\tScan the input sequence (0), the reverse complement (1) or both (2) [0]\n";
+	$output .= "\t-e / --energy\t\tCalculate hybridization energies [DISABLED]\n";
+	$output .= "\n";
+
+	return $output;
+}
+
+sub runningHeader{
+# Header with information about the software version
+	my $output = "===================================================\n";
+	$output .= "=                seedVicious v1.0                 =\n";
+	$output .= "===================================================\n";
+	$output .= "-   A versatile microRNA target prediction tool   -\n";
+	$output .= "---------------------------------------------------\n";
+	$output .= "-                                                 -\n";
+	$output .= "-                 Antonio Marco                   -\n";
+	$output .= "-               http://amarco.net/                -\n";
+	$output .= "-           University of Essex, 2016             -\n";
+	$output .= "-                                                 -\n";
+	$output .= "-                                                 -\n";
+	$output .= "- Please cite:                                    -\n";
+	$output .= "-  Marco (2010) biorXiv XXXX                      -\n";
+	$output .= "---------------------------------------------------\n\n";
+
+	return $output;
+}
